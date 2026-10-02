@@ -7,85 +7,146 @@ permissions:
 jobs:
   finalize:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     env:
       SOURCE_RUN_ID: '36988082313'
       SOURCE_COMMIT: 5c9871b88676f69c98cc9119ac3af49f8490bfe5
       GH_TOKEN: ${{ github.token }}
+      KERNEL_SHA: 65b954a773b183a9999b06bb1b2f921f12eaaf11
+      SUKI_SHA: b20dee702035af09cb2ecb5f35443bbc1747f3e6
+      SUSFS_SHA: 0730de4f5d46ee2997f953101b0f608c0b400b38
+      AK3_SHA: 020dfeccf9d7e962a48400fc94d3e451df92eead
+      PACKAGE_NAME: GT7Pro_RMX5010_16.0.10.500_SukiSU_Ultra_SUSFS_6.6.118
     steps:
       - uses: actions/checkout@v4
-      - name: Require the verified build to finish successfully
+      - name: Require successful pinned compilation and kernel verification
         run: |
           set -euo pipefail
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" --jq .head_sha)" = "$SOURCE_COMMIT"
-          gh run watch "$SOURCE_RUN_ID" --exit-status --interval 20
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" > source-jobs.json
+          python3 - <<'PY'
+          import json
+          jobs=json.load(open('source-jobs.json'))['jobs']
+          assert len(jobs)==1
+          steps={s['name']:s['conclusion'] for s in jobs[0]['steps']}
+          for n in ['Compile kernel and modules','Validate the actual image and all required kernel interfaces']:
+              assert steps[n]=='success',n
+          print('Pinned source compilation and 3831-interface verification succeeded')
+          PY
       - uses: actions/download-artifact@v4
         with:
-          name: GT7Pro-current-verified-deliverables
-          path: deliverables
+          name: GT7Pro-current-build-diagnostics
+          path: .
           run-id: ${{ env.SOURCE_RUN_ID }}
           github-token: ${{ github.token }}
-      - name: Verify images and finalize strictly boot-only installer
+      - name: Recheck the preserved verified kernel
+        run: |
+          set -euo pipefail
+          echo 'c3ee7edceef736eec2a8311743687d1a1b40b531d265fcd60f76035bfb2e4053  gt7pro-current-inputs.tar.gz' | sha256sum -c -
+          tar -xzf gt7pro-current-inputs.tar.gz
+          gzip -dc gt7pro-inputs/stock-boot.img.gz > stock-boot.img
+          python3 - <<'PY'
+          import pathlib,json,hashlib,gzip,re,struct
+          out=pathlib.Path('common/out');image=(out/'arch/arm64/boot/Image').read_bytes()
+          assert len(image)==36928000 and hashlib.sha256(image).hexdigest()=='a7facaa00c0c2d3256e2fef61dd831a6db90b2018a4f50d2d8cf3336d3f2ffa1'
+          stock=pathlib.Path('stock-boot.img').read_bytes()
+          assert hashlib.sha256(stock).hexdigest()=='72eb01045a50839e61c34b258f4d8af463fcee97124dc677364eea9831c66838'
+          assert image[56:60]==b'ARM\x64' and (struct.unpack_from('<Q',image,24)[0]>>1)&3==1
+          st=image.index(b'IKCFG_ST');en=image.index(b'IKCFG_ED',st)
+          config=gzip.decompress(image[st+8:en]).decode()
+          assert config==(out/'.config').read_text()
+          cfg=dict(re.findall(r'^(CONFIG_\w+)=(.*)$',config,re.M))
+          for n in ['KSU','KSU_SUSFS','ARM64_4K_PAGES','MODVERSIONS','CFI_CLANG','PREEMPT','MODULES','MODULE_SIG_PROTECT','MODULE_ALLOW_BTF_MISMATCH']:
+              assert cfg['CONFIG_'+n]=='y'
+          assert cfg.get('CONFIG_KPM')!='y'
+          assert stock[4096+34511616:4096+34511616+1357] in image
+          report=json.loads((out/'compatibility-report.json').read_text())
+          assert report['passed'] and not report['errors'] and report['required_kernel_symbols']==3831 and report['matching_kernel_symbols']==3831
+          assert report['stock_module_certificate_embedded'] and report['image_sha256']==hashlib.sha256(image).hexdigest()
+          actual={}
+          for line in (out/'Module.symvers').read_text().splitlines():
+              p=line.split()
+              if len(p)>=3 and p[2]=='vmlinux':actual[p[1]]=int(p[0],16)
+          required=json.loads(pathlib.Path('gt7pro-required-kernel-crcs.json').read_text())
+          assert len(required)==3831 and all(actual.get(n)==int(v,16) for n,v in required.items())
+          report['installer_writes_only_current_slot_boot']=True
+          report['automatic_vbmeta_partition_patch_disabled']=True
+          (out/'compatibility-report.json').write_text(json.dumps(report,indent=2))
+          print('Preserved kernel reverified: actual Image, embedded config, certificate, all 3831 CRCs')
+          PY
+      - name: Repack current-version boot offline
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 https://github.com/topjohnwu/Magisk/releases/download/v29.0/Magisk-v29.0.apk -o magisk.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+          mkdir repack
+          cd repack
+          ../magiskboot unpack ../stock-boot.img
+          cp ../common/out/arch/arm64/boot/Image kernel
+          ../magiskboot repack ../stock-boot.img ../boot-new.img
+          cd ..
+          curl -fL --retry 3 'https://android.googlesource.com/platform/external/avb/+/refs/tags/android-16.0.0_r1/avbtool.py?format=TEXT' | base64 -d > avbtool.py
+          python3 avbtool.py erase_footer --image boot-new.img
+          python3 avbtool.py add_hash_footer --image boot-new.img --partition_name boot --partition_size 100663296 --algorithm NONE --hash_algorithm sha256 --prop com.android.build.boot.os_version:15 --prop com.android.build.boot.security_patch:2026-08-01
+          cp boot-new.img boot.img
+          python3 avbtool.py verify_image --image boot.img
+          python3 - <<'PY'
+          import pathlib,struct,hashlib
+          b=pathlib.Path('boot-new.img').read_bytes(); image=pathlib.Path('common/out/arch/arm64/boot/Image').read_bytes()
+          assert len(b)==100663296 and b[:8]==b'ANDROID!'
+          assert struct.unpack_from('<I',b,40)[0]==4
+          n,ramdisk=struct.unpack_from('<II',b,8)
+          assert ramdisk==0 and n==len(image) and b[4096:4096+n]==image
+          print('Repacked boot: header v4, kernel exact match, zero ramdisk, 96 MiB, verified AVB hash')
+          print('boot SHA256:',hashlib.sha256(b).hexdigest())
+          PY
+      - name: Package transparent AnyKernel3 installer and boot image
+        run: |
+          set -euo pipefail
+          mkdir AnyKernel3 deliverables verification
+          curl -fL --retry 3 "https://github.com/osm0sis/AnyKernel3/archive/$AK3_SHA.tar.gz" | tar -xz --strip-components=1 -C AnyKernel3
+          sed -i '/^PATCH_VBMETA_FLAG=0;/a NO_VBMETA_PARTITION_PATCH=1;' gt7pro-inputs/anykernel.sh
+          cp gt7pro-inputs/anykernel.sh AnyKernel3/anykernel.sh
+          cp common/out/arch/arm64/boot/Image AnyKernel3/Image
+          bash -n AnyKernel3/anykernel.sh
+          (cd AnyKernel3 && zip -qr9 "../deliverables/${PACKAGE_NAME}_AnyKernel3.zip" . -x '*.git*' 'README.md' 'ak3-helper.sh' 'example*')
+          cp boot-new.img "deliverables/${PACKAGE_NAME}_boot.img"
+          cp common/out/.config verification/kernel.config
+          cp common/out/Module.symvers verification/Module.symvers
+          cp common/out/compatibility-report.json verification/
+          cp gt7pro-inputs/anykernel.sh verification/
+          printf '%s\n' "Kernel source: $KERNEL_SHA" "SukiSU source: $SUKI_SHA" "SUSFS source: $SUSFS_SHA" "AnyKernel3 source: $AK3_SHA" 'Device: RMX5010 GT7 Pro' 'System: RMX5010_16.0.10.500(CN01)' 'Static build checks passed; no physical-device boot test performed.' > verification/build-info.txt
+          zip -qr9 deliverables/verification.zip verification
+          curl -fL --retry 3 "https://raw.githubusercontent.com/OnePlusOSS/android_kernel_common_oneplus_sm8750/$KERNEL_SHA/COPYING" -o deliverables/kernel-LICENSE.txt
+          cat > deliverables/READ-ME.txt <<'TXT'
+          适用：真我 GT7 Pro RMX5010，RMX5010_16.0.10.500(CN01)，Android 16。
+          内核：6.6.118，4K，内置 SukiSU Ultra + SUSFS 2.3.0。
+          AnyKernel3.zip 是内核安装包；boot.img 是使用当前版本原厂 boot 生成的完整镜像。
+          两种文件用于同一次内核更换，只需选择一种方式。boot.img 对应 boot 分区。
+          不要把 boot.img 写入 init_boot、vendor_boot 或其他分区。
+          保留当前原厂 boot.img 备份。安装包会检查机型、完整系统指纹和内核版本。
+          编译、3831 项内核接口 CRC、原厂模块公钥、镜像结构和 AVB 哈希已检查。
+          未做这台手机上的实际开机测试，不能保证绝对无风险。
+          verification.zip 包含构建配置、接口表和检查报告；SHA256SUMS.txt 用于核对下载文件。
+          源码和补丁：本仓库 Build_gt7pro_current.yml 与 gt7pro-current-inputs.tar.gz。
+          TXT
+          (cd deliverables && sha256sum *.zip *.img > SHA256SUMS.txt)
+          cat deliverables/SHA256SUMS.txt
+      - name: Verify the final downloadable package
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import pathlib,zipfile,json,hashlib,struct,re,gzip,tarfile
-          folder=pathlib.Path('deliverables')
-          for line in (folder/'SHA256SUMS.txt').read_text().splitlines():
-              digest,name=line.split(None,1);assert pathlib.PurePath(name).name==name
-              assert hashlib.sha256((folder/name).read_bytes()).hexdigest()==digest
-          b=next(folder.glob('*_boot.img')).read_bytes()
-          assert len(b)==100663296 and b[:8]==b'ANDROID!'
-          ks,rs,osv,hs=struct.unpack_from('<IIII',b,8)
-          assert struct.unpack_from('<I',b,40)[0]==4 and rs==0 and hs==1584
-          image=b[4096:4096+ks];assert image[56:60]==b'ARM\x64'
-          assert (struct.unpack_from('<Q',image,24)[0]>>1)&3==1
-          st=image.index(b'IKCFG_ST');en=image.index(b'IKCFG_ED',st);config=gzip.decompress(image[st+8:en]).decode()
-          with tarfile.open('gt7pro-current-inputs.tar.gz') as t:
-              stock=gzip.decompress(t.extractfile('gt7pro-inputs/stock-boot.img.gz').read())
-          assert hashlib.sha256(stock).hexdigest()=='72eb01045a50839e61c34b258f4d8af463fcee97124dc677364eea9831c66838'
-          assert b[16:1584]==stock[16:1584]
-          assert stock[4096+34511616:4096+34511616+1357] in image
-          zpath=next(folder.glob('*_AnyKernel3.zip'))
-          with zipfile.ZipFile(zpath) as z:
+          import pathlib,zipfile,hashlib,json
+          folder=pathlib.Path('deliverables');image=pathlib.Path('common/out/arch/arm64/boot/Image').read_bytes()
+          with zipfile.ZipFile(next(folder.glob('*_AnyKernel3.zip'))) as z:
               assert z.testzip() is None and z.read('Image')==image and 'LICENSE' in z.namelist()
+              assert all(not n.startswith('/') and '..' not in pathlib.PurePosixPath(n).parts for n in z.namelist())
               assert hashlib.sha256(z.read('tools/ak3-core.sh')).hexdigest()=='f7a51cfe2e093016a34a76e16de6c9885c2d1992c3482fcabc668680e1f0f6bb'
-              original=z.read('anykernel.sh').decode()
-              assert original.count('PATCH_VBMETA_FLAG=0;\n')==1
-              assert 'NO_VBMETA_PARTITION_PATCH' not in original
-              installer=original.replace('PATCH_VBMETA_FLAG=0;\n','PATCH_VBMETA_FLAG=0;\nNO_VBMETA_PARTITION_PATCH=1;\n')
-              assert 'BLOCK=boot;' in installer and 'IS_SLOT_DEVICE=1;' in installer
-              assert 'realme/RMX5010/RE6018L1:16/BP2A.250605.015/V.2a20db9-4ff7c3-520e61:user/release-keys' in installer
-              entries=[(i,z.read(i.filename)) for i in z.infolist()]
-          def rewrite(path,entries,replace):
-              tmp=path.with_suffix('.new.zip')
-              with zipfile.ZipFile(tmp,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=9) as z:
-                  for i,data in entries:
-                      assert not i.filename.startswith('/') and '..' not in pathlib.PurePosixPath(i.filename).parts
-                      z.writestr(i,replace.get(i.filename,data))
-              with zipfile.ZipFile(tmp) as z:assert z.testzip() is None
-              tmp.replace(path)
-          rewrite(zpath,entries,{'anykernel.sh':installer.encode()})
-          vp=folder/'verification.zip'
-          with zipfile.ZipFile(vp) as z:
-              assert z.testzip() is None and z.read('verification/kernel.config').decode()==config
-              report=json.loads(z.read('verification/compatibility-report.json'))
-              assert report['passed'] and not report['errors'] and report['required_kernel_symbols']==3831
-              assert report['matching_kernel_symbols']==3831 and report['stock_module_certificate_embedded']
-              assert hashlib.sha256(image).hexdigest()==report['image_sha256']
-              actual={}
-              for line in z.read('verification/Module.symvers').decode().splitlines():
-                  parts=line.split()
-                  if len(parts)>=3 and parts[2]=='vmlinux':actual[parts[1]]=int(parts[0],16)
-              required=json.loads(pathlib.Path('gt7pro-required-kernel-crcs.json').read_text())
-              assert len(required)==3831 and all(actual.get(n)==int(v,16) for n,v in required.items())
-              entries=[(i,z.read(i.filename)) for i in z.infolist()]
-          report['installer_writes_only_current_slot_boot']=True
-          report['automatic_vbmeta_partition_patch_disabled']=True
-          rewrite(vp,entries,{'verification/anykernel.sh':installer.encode(),'verification/compatibility-report.json':json.dumps(report,indent=2).encode()})
-          (folder/'final-verification.json').write_text(json.dumps(report,indent=2))
+              script=z.read('anykernel.sh').decode()
+              assert 'NO_VBMETA_PARTITION_PATCH=1;' in script and 'BLOCK=boot;' in script and 'PATCH_VBMETA_FLAG=0;' in script
+          (folder/'final-verification.json').write_text(pathlib.Path('common/out/compatibility-report.json').read_text())
           (folder/'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in sorted(folder.iterdir()) if p.is_file() and p.name!='SHA256SUMS.txt'))
-          print('Final package verified: 3831 CRCs, stock certificate, exact image/config, boot-only installer, vbmeta untouched')
           print((folder/'SHA256SUMS.txt').read_text())
           PY
       - uses: actions/upload-artifact@v4
@@ -97,5 +158,10 @@ jobs:
         run: |
           set -euo pipefail
           TAG="GT7Pro-16.0.10.500-SukiSU-SUSFS-$SOURCE_RUN_ID"
-          gh release upload "$TAG" deliverables/* --clobber
-          gh release edit "$TAG" --notes 'Final reviewed build for RMX5010_16.0.10.500(CN01), Android 16, 4K kernel 6.6.118. SukiSU Ultra + SUSFS 2.3.0 built in. All 3831 required kernel symbol CRCs verified against original vendor_boot, vendor_dlkm and system_dlkm modules. Original module trust certificate retained. ZIP and boot.img contain the identical verified kernel. Installer checks exact firmware fingerprint and writes only current-slot boot; automatic vbmeta partition patch is disabled. Final file hashes included. Static verification only: no physical-device boot test.'
+          NOTES='RMX5010_16.0.10.500(CN01), Android 16, 4K kernel 6.6.118. SukiSU Ultra + SUSFS 2.3.0 built in. All 3831 required kernel symbol CRCs verified against original modules. Original module trust certificate retained. ZIP and boot.img contain the identical verified kernel. Installer checks exact firmware fingerprint and writes only current-slot boot; automatic vbmeta partition patch disabled. Custom unsigned AVB footer for unlocked devices. Static verification only: no physical-device boot test.'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" deliverables/* --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" deliverables/* --target "$GITHUB_SHA" --title 'GT7 Pro 16.0.10.500 SukiSU Ultra + SUSFS 6.6.118' --notes "$NOTES"
+          fi
