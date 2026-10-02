@@ -177,6 +177,7 @@ jobs:
           set -euo pipefail
           mkdir AnyKernel3 deliverables verification
           curl -fL --retry 3 "https://github.com/osm0sis/AnyKernel3/archive/$AK3_SHA.tar.gz" | tar -xz --strip-components=1 -C AnyKernel3
+          sed -i '/^PATCH_VBMETA_FLAG=0;/a NO_VBMETA_PARTITION_PATCH=1;' gt7pro-inputs/anykernel.sh
           cp gt7pro-inputs/anykernel.sh AnyKernel3/anykernel.sh
           cp common/out/arch/arm64/boot/Image AnyKernel3/Image
           bash -n AnyKernel3/anykernel.sh
