@@ -70,7 +70,23 @@ jobs:
           cd common
           mkdir out
           cp ../gt7pro-inputs/stock.config out/.config
+          python3 - <<'PY'
+          import pathlib,re,json,hashlib
+          stg=pathlib.Path('android/abi_gki_aarch64.stg').read_text()
+          names=set(re.findall(r'elf_symbol \{\s+id: [^\n]+\s+name: "([^"]+)"',stg))
+          required=json.loads(pathlib.Path('../gt7pro-inputs/required-kernel-crcs.json').read_text())
+          assert len(names)>9000 and set(required)<=names
+          pathlib.Path('out/abi_symbollist.raw').write_text('\n'.join(sorted(names))+'\n')
+          stock=pathlib.Path('../stock-boot.img').read_bytes()
+          cert=stock[4096+34511616:4096+34511616+1357]
+          assert cert[:4]==bytes.fromhex('30820549')
+          pathlib.Path('certs/stock-trusted.der').write_bytes(cert)
+          print('Retained original module certificate and reconstructed',len(names),'ABI exports')
+          print('Stock public certificate SHA256:',hashlib.sha256(cert).hexdigest())
+          PY
+          openssl x509 -inform DER -in certs/stock-trusted.der -out certs/stock-trusted.pem
           scripts/config --file out/.config -e KSU -e KSU_SUSFS -d KPM -d KSU_DEBUG -d LOCALVERSION_AUTO --set-str LOCALVERSION '-android15-8-SukiSU-SUSFS-4k'
+          scripts/config --file out/.config --set-str SYSTEM_TRUSTED_KEYS 'certs/stock-trusted.pem'
           make O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 olddefconfig
           grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_ARM64_4K_PAGES|CONFIG_CFI_CLANG|CONFIG_MODVERSIONS|CONFIG_LOCALVERSION)=' out/.config
           make O=out LLVM=1 ARCH=arm64 LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 kernelrelease
