@@ -161,7 +161,8 @@ jobs:
           curl -fL --retry 3 'https://android.googlesource.com/platform/external/avb/+/refs/tags/android-16.0.0_r1/avbtool.py?format=TEXT' | base64 -d > avbtool.py
           python3 avbtool.py erase_footer --image boot-new.img
           python3 avbtool.py add_hash_footer --image boot-new.img --partition_name boot --partition_size 100663296 --algorithm NONE --hash_algorithm sha256 --prop com.android.build.boot.os_version:15 --prop com.android.build.boot.security_patch:2026-08-01
-          python3 avbtool.py verify_image --image boot-new.img
+          cp boot-new.img boot.img
+          python3 avbtool.py verify_image --image boot.img
           python3 - <<'PY'
           import pathlib,struct,hashlib
           b=pathlib.Path('boot-new.img').read_bytes(); image=pathlib.Path('common/out/arch/arm64/boot/Image').read_bytes()
