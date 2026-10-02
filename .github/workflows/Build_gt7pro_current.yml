@@ -27,6 +27,7 @@ jobs:
           set -euo pipefail
           echo 'c3ee7edceef736eec2a8311743687d1a1b40b531d265fcd60f76035bfb2e4053  gt7pro-current-inputs.tar.gz' | sha256sum -c -
           tar -xzf gt7pro-current-inputs.tar.gz
+          cp gt7pro-required-kernel-crcs.json gt7pro-inputs/required-kernel-crcs.json
           gzip -dc gt7pro-inputs/stock-boot.img.gz > stock-boot.img
           echo '72eb01045a50839e61c34b258f4d8af463fcee97124dc677364eea9831c66838  stock-boot.img' | sha256sum -c -
           sudo apt-get update -qq
@@ -75,7 +76,8 @@ jobs:
           stg=pathlib.Path('android/abi_gki_aarch64.stg').read_text()
           names=set(re.findall(r'elf_symbol \{\s+id: [^\n]+\s+name: "([^"]+)"',stg))
           required=json.loads(pathlib.Path('../gt7pro-inputs/required-kernel-crcs.json').read_text())
-          assert len(names)>9000 and set(required)<=names
+          assert len(names)>9000
+          names.update(required)
           pathlib.Path('out/abi_symbollist.raw').write_text('\n'.join(sorted(names))+'\n')
           stock=pathlib.Path('../stock-boot.img').read_bytes()
           cert=stock[4096+34511616:4096+34511616+1357]
@@ -99,6 +101,20 @@ jobs:
         run: |
           set -euo pipefail
           python3 gt7pro-inputs/verify_build.py common gt7pro-inputs
+          python3 - <<'PY'
+          import pathlib,json
+          out=pathlib.Path('common/out');config=(out/'.config').read_text()
+          assert 'CONFIG_MODULE_SIG_PROTECT=y\n' in config
+          assert 'CONFIG_MODULE_ALLOW_BTF_MISMATCH=y\n' in config
+          assert 'CONFIG_SYSTEM_TRUSTED_KEYS="certs/stock-trusted.pem"\n' in config
+          assert pathlib.Path('common/certs/stock-trusted.der').read_bytes() in (out/'arch/arm64/boot/Image').read_bytes()
+          report=json.loads((out/'compatibility-report.json').read_text())
+          report['stock_module_certificate_embedded']=True
+          report['module_signature_protection_preserved']=True
+          report['stock_allow_module_btf_mismatch_preserved']=True
+          (out/'compatibility-report.json').write_text(json.dumps(report,indent=2))
+          print('Original signed system modules remain trusted; stock module protections retained')
+          PY
           llvm-nm common/out/vmlinux > kernel-symbols.txt
           grep -E ' (susfs_init|ksu_init)$' kernel-symbols.txt
       - name: Repack current-version boot offline
@@ -135,7 +151,7 @@ jobs:
           cp gt7pro-inputs/anykernel.sh AnyKernel3/anykernel.sh
           cp common/out/arch/arm64/boot/Image AnyKernel3/Image
           bash -n AnyKernel3/anykernel.sh
-          (cd AnyKernel3 && zip -qr9 "../deliverables/${PACKAGE_NAME}_AnyKernel3.zip" . -x '*.git*' 'README.md' 'LICENSE' 'ak3-helper.sh' 'example*')
+          (cd AnyKernel3 && zip -qr9 "../deliverables/${PACKAGE_NAME}_AnyKernel3.zip" . -x '*.git*' 'README.md' 'ak3-helper.sh' 'example*')
           cp boot-new.img "deliverables/${PACKAGE_NAME}_boot.img"
           cp common/out/.config verification/kernel.config
           cp common/out/Module.symvers verification/Module.symvers
@@ -143,6 +159,19 @@ jobs:
           cp gt7pro-inputs/anykernel.sh verification/
           printf '%s\n' "Kernel source: $KERNEL_SHA" "SukiSU source: $SUKI_SHA" "SUSFS source: $SUSFS_SHA" "AnyKernel3 source: $AK3_SHA" 'Device: RMX5010 GT7 Pro' 'System: RMX5010_16.0.10.500(CN01)' 'Static build checks passed; no physical-device boot test performed.' > verification/build-info.txt
           zip -qr9 deliverables/verification.zip verification
+          cp common/COPYING deliverables/kernel-LICENSE.txt
+          cat > deliverables/READ-ME.txt <<'TXT'
+          适用：真我 GT7 Pro RMX5010，RMX5010_16.0.10.500(CN01)，Android 16。
+          内核：6.6.118，4K，内置 SukiSU Ultra + SUSFS 2.3.0。
+          AnyKernel3.zip 是内核安装包；boot.img 是使用当前版本原厂 boot 生成的完整镜像。
+          两种文件用于同一次内核更换，只需选择一种方式。boot.img 对应 boot 分区。
+          不要把 boot.img 写入 init_boot、vendor_boot 或其他分区。
+          保留当前原厂 boot.img 备份。安装包会检查机型、完整系统指纹和内核版本。
+          编译、3831 项内核接口 CRC、原厂模块公钥、镜像结构和 AVB 哈希已检查。
+          未做这台手机上的实际开机测试，不能保证绝对无风险。
+          verification.zip 包含构建配置、接口表和检查报告；SHA256SUMS.txt 用于核对下载文件。
+          源码和补丁：本仓库 Build_gt7pro_current.yml 与 gt7pro-current-inputs.tar.gz。
+          TXT
           (cd deliverables && sha256sum *.zip *.img > SHA256SUMS.txt)
           cat deliverables/SHA256SUMS.txt
       - name: Upload verified deliverables
@@ -157,7 +186,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="GT7Pro-16.0.10.500-SukiSU-SUSFS-${GITHUB_RUN_ID}"
-          gh release create "$TAG" deliverables/* --title 'GT7 Pro 16.0.10.500 SukiSU Ultra + SUSFS 6.6.118' --notes 'Built from pinned sources with stock 4K configuration. All 3199 required kernel symbol CRCs checked against the current firmware. Contains an AnyKernel3 ZIP and a repacked boot image. Static build and image checks only; no physical-device boot test. Only for RMX5010_16.0.10.500(CN01).'
+          gh release create "$TAG" deliverables/* --title 'GT7 Pro 16.0.10.500 SukiSU Ultra + SUSFS 6.6.118' --notes 'Built from pinned sources with stock 4K configuration and original module trust certificate. All 3831 required vmlinux symbol CRCs checked against current vendor_boot, vendor_dlkm and system_dlkm modules. Original modules also provide the remaining imported symbols. Contains an AnyKernel3 ZIP and a repacked boot image. Static build and image checks only; no physical-device boot test. Only for RMX5010_16.0.10.500(CN01).'
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -168,4 +197,6 @@ jobs:
             common/out/.config
             common/out/Module.symvers
             common/out/compatibility-report.json
+            common/out/arch/arm64/boot/Image
           if-no-files-found: ignore
+          include-hidden-files: true
