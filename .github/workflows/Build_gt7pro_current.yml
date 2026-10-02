@@ -169,8 +169,14 @@ jobs:
           assert len(b)==100663296 and b[:8]==b'ANDROID!'
           assert struct.unpack_from('<I',b,40)[0]==4
           n,ramdisk=struct.unpack_from('<II',b,8)
-          assert ramdisk==0 and n==len(image) and b[4096:4096+n]==image
-          print('Repacked boot: header v4, kernel exact match, zero ramdisk, 96 MiB, verified AVB hash')
+          stock=pathlib.Path('stock-boot.img').read_bytes()
+          stock_n=struct.unpack_from('<I',stock,8)[0]
+          dtb=stock[4096+34541248:4096+stock_n]
+          assert len(dtb)==2325312 and dtb[:4]==bytes.fromhex('d00dfeed')
+          assert hashlib.sha256(dtb).hexdigest()=='2fb85f9b8827d345f11c066a61846e7483f8d509001a47a162b139fd184ae49c'
+          assert ramdisk==0 and n==len(image)+len(dtb) and b[4096:4096+n]==image+dtb
+          assert b[16:1584]==stock[16:1584]
+          print('Repacked boot: header v4, kernel and original appended device trees exact match, zero ramdisk, 96 MiB, verified AVB hash')
           print('boot SHA256:',hashlib.sha256(b).hexdigest())
           PY
       - name: Package transparent AnyKernel3 installer and boot image
