@@ -62,6 +62,34 @@ jobs:
           git apply ../gt7pro-inputs/susfs.patch
           git apply --check ../gt7pro-inputs/flicker.patch
           git apply ../gt7pro-inputs/flicker.patch
+          python3 - <<'PY'
+          import pathlib,re
+          su=pathlib.Path('../KernelSU/kernel/feature/sucompat.c').read_text()
+          assert 'bool ksu_su_compat_enabled __read_mostly = true;' in su
+          assert 'ksu_handle_post_execveat_sucompat' not in su
+          for name in ['fs/exec.c','fs/open.c','fs/stat.c']:
+              p=pathlib.Path(name);s=p.read_text()
+              assert s.count('extern struct static_key_true ksu_su_compat_enabled;')==1
+              assert s.count('static_branch_likely(&ksu_su_compat_enabled)')==1
+              s=s.replace('extern struct static_key_true ksu_su_compat_enabled;','extern bool ksu_su_compat_enabled;')
+              s=s.replace('static_branch_likely(&ksu_su_compat_enabled)','READ_ONCE(ksu_su_compat_enabled)')
+              p.write_text(s)
+          p=pathlib.Path('fs/exec.c');s=p.read_text()
+          s,n=re.subn(r'extern int ksu_handle_post_execveat_sucompat\([^;]+;\n','',s);assert n==1
+          s,n=re.subn(r'#ifdef CONFIG_KSU_SUSFS\n\tbool is_su_session = false;\n#endif // #ifdef CONFIG_KSU_SUSFS\n','',s);assert n==1
+          assert s.count('is_su_session = !ksu_handle_execveat')==2
+          s=s.replace('is_su_session = !ksu_handle_execveat','(void)ksu_handle_execveat')
+          s,n=re.subn(r'#ifdef CONFIG_KSU_SUSFS\n\tif \(unlikely\(is_su_session\)\)\n\t\t\(void\)ksu_handle_post_execveat_sucompat\([^;]+;\n#endif // #ifdef CONFIG_KSU_SUSFS\n','',s);assert n==1
+          assert 'post_execveat' not in s and 'is_su_session' not in s
+          p.write_text(s)
+          p=pathlib.Path('fs/read_write.c');s=p.read_text()
+          old='extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);'
+          assert s.count(old)==1 and s.count('ksu_handle_sys_read(fd);')==1
+          s=s.replace(old,'extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);')
+          s=s.replace('ksu_handle_sys_read(fd);','(void)ksu_handle_sys_read(fd, &buf, &count);')
+          p.write_text(s)
+          print('SUSFS hooks aligned to pinned SukiSU builtin: boolean toggle, pre-exec root handling, correct read signature')
+          PY
           if find . -name '*.rej' -print -quit | grep -q .; then exit 1; fi
           grep -q 'config KSU_SUSFS' drivers/kernelsu/Kconfig
           grep -q 'CONFIG_KSU_SUSFS.*susfs.o' fs/Makefile
@@ -116,7 +144,8 @@ jobs:
           print('Original signed system modules remain trusted; stock module protections retained')
           PY
           llvm-nm common/out/vmlinux > kernel-symbols.txt
-          grep -E ' (susfs_init|ksu_init)$' kernel-symbols.txt
+          grep -E ' susfs_init$' kernel-symbols.txt
+          grep -E ' kernelsu_init$' kernel-symbols.txt
       - name: Repack current-version boot offline
         run: |
           set -euo pipefail
