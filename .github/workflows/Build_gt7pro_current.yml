@@ -1,0 +1,155 @@
+name: GT7 Pro current 6.6.118 SukiSU SUSFS verified build
+run-name: GT7 Pro RMX5010 16.0.10.500 SukiSU Ultra + SUSFS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      KERNEL_SHA: 65b954a773b183a9999b06bb1b2f921f12eaaf11
+      SUKI_SHA: b20dee702035af09cb2ecb5f35443bbc1747f3e6
+      SUSFS_SHA: 0730de4f5d46ee2997f953101b0f608c0b400b38
+      AK3_SHA: 020dfeccf9d7e962a48400fc94d3e451df92eead
+      PACKAGE_NAME: GT7Pro_RMX5010_16.0.10.500_SukiSU_Ultra_SUSFS_6.6.118
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare verified inputs
+        run: |
+          set -euo pipefail
+          echo 'c3ee7edceef736eec2a8311743687d1a1b40b531d265fcd60f76035bfb2e4053  gt7pro-current-inputs.tar.gz' | sha256sum -c -
+          tar -xzf gt7pro-current-inputs.tar.gz
+          gzip -dc gt7pro-inputs/stock-boot.img.gz > stock-boot.img
+          echo '72eb01045a50839e61c34b258f4d8af463fcee97124dc677364eea9831c66838  stock-boot.img' | sha256sum -c -
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev dwarves python3 zip unzip gcc-aarch64-linux-gnu ccache
+      - name: Fetch pinned sources and compiler
+        run: |
+          set -euo pipefail
+          mkdir common
+          curl -fL --retry 3 "https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750/archive/$KERNEL_SHA.tar.gz" | tar -xz --strip-components=1 -C common
+          git -C common init -q
+          git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
+          git -C KernelSU checkout "$SUKI_SHA"
+          test "$(git -C KernelSU rev-parse HEAD)" = "$SUKI_SHA"
+          mkdir susfs
+          curl -fL --retry 3 "https://github.com/cctv18/susfs4oki/archive/$SUSFS_SHA.tar.gz" | tar -xz --strip-components=1 -C susfs
+          curl -fL --retry 3 https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip
+          mkdir clang18
+          unzip -q clang.zip -d clang18
+          test -x clang18/bin/clang
+          echo "$GITHUB_WORKSPACE/clang18/bin" >> "$GITHUB_PATH"
+          clang18/bin/clang --version
+      - name: Apply SukiSU and SUSFS strictly
+        run: |
+          set -euo pipefail
+          cd common
+          ln -s ../../KernelSU/kernel drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+          cp ../susfs/kernel_patches/fs/* fs/
+          cp ../susfs/kernel_patches/include/linux/* include/linux/
+          git apply --check ../gt7pro-inputs/susfs.patch
+          git apply ../gt7pro-inputs/susfs.patch
+          git apply --check ../gt7pro-inputs/flicker.patch
+          git apply ../gt7pro-inputs/flicker.patch
+          if find . -name '*.rej' -print -quit | grep -q .; then exit 1; fi
+          grep -q 'config KSU_SUSFS' drivers/kernelsu/Kconfig
+          grep -q 'CONFIG_KSU_SUSFS.*susfs.o' fs/Makefile
+      - name: Configure from the actual stock kernel
+        run: |
+          set -euo pipefail
+          cd common
+          mkdir out
+          cp ../gt7pro-inputs/stock.config out/.config
+          scripts/config --file out/.config -e KSU -e KSU_SUSFS -d KPM -d KSU_DEBUG -d LOCALVERSION_AUTO --set-str LOCALVERSION '-android15-8-SukiSU-SUSFS-4k'
+          make O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 olddefconfig
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_ARM64_4K_PAGES|CONFIG_CFI_CLANG|CONFIG_MODVERSIONS|CONFIG_LOCALVERSION)=' out/.config
+          make O=out LLVM=1 ARCH=arm64 LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 kernelrelease
+      - name: Compile kernel and modules
+        run: |
+          set -euo pipefail
+          cd common
+          make -j"$(nproc)" O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 Image modules 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+      - name: Validate the actual image and all required kernel interfaces
+        run: |
+          set -euo pipefail
+          python3 gt7pro-inputs/verify_build.py common gt7pro-inputs
+          llvm-nm common/out/vmlinux > kernel-symbols.txt
+          grep -E ' (susfs_init|ksu_init)$' kernel-symbols.txt
+      - name: Repack current-version boot offline
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 https://github.com/topjohnwu/Magisk/releases/download/v29.0/Magisk-v29.0.apk -o magisk.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+          mkdir repack
+          cd repack
+          ../magiskboot unpack ../stock-boot.img
+          cp ../common/out/arch/arm64/boot/Image kernel
+          ../magiskboot repack ../stock-boot.img ../boot-new.img
+          cd ..
+          curl -fL --retry 3 'https://android.googlesource.com/platform/external/avb/+/refs/tags/android-16.0.0_r1/avbtool.py?format=TEXT' | base64 -d > avbtool.py
+          python3 avbtool.py erase_footer --image boot-new.img
+          python3 avbtool.py add_hash_footer --image boot-new.img --partition_name boot --partition_size 100663296 --algorithm NONE --hash_algorithm sha256 --prop com.android.build.boot.os_version:15 --prop com.android.build.boot.security_patch:2026-08-01
+          python3 avbtool.py verify_image --image boot-new.img
+          python3 - <<'PY'
+          import pathlib,struct,hashlib
+          b=pathlib.Path('boot-new.img').read_bytes(); image=pathlib.Path('common/out/arch/arm64/boot/Image').read_bytes()
+          assert len(b)==100663296 and b[:8]==b'ANDROID!'
+          assert struct.unpack_from('<I',b,40)[0]==4
+          n,ramdisk=struct.unpack_from('<II',b,8)
+          assert ramdisk==0 and n==len(image) and b[4096:4096+n]==image
+          print('Repacked boot: header v4, kernel exact match, zero ramdisk, 96 MiB, verified AVB hash')
+          print('boot SHA256:',hashlib.sha256(b).hexdigest())
+          PY
+      - name: Package transparent AnyKernel3 installer and boot image
+        run: |
+          set -euo pipefail
+          mkdir AnyKernel3 deliverables verification
+          curl -fL --retry 3 "https://github.com/osm0sis/AnyKernel3/archive/$AK3_SHA.tar.gz" | tar -xz --strip-components=1 -C AnyKernel3
+          cp gt7pro-inputs/anykernel.sh AnyKernel3/anykernel.sh
+          cp common/out/arch/arm64/boot/Image AnyKernel3/Image
+          bash -n AnyKernel3/anykernel.sh
+          (cd AnyKernel3 && zip -qr9 "../deliverables/${PACKAGE_NAME}_AnyKernel3.zip" . -x '*.git*' 'README.md' 'LICENSE' 'ak3-helper.sh' 'example*')
+          cp boot-new.img "deliverables/${PACKAGE_NAME}_boot.img"
+          cp common/out/.config verification/kernel.config
+          cp common/out/Module.symvers verification/Module.symvers
+          cp common/out/compatibility-report.json verification/
+          cp gt7pro-inputs/anykernel.sh verification/
+          printf '%s\n' "Kernel source: $KERNEL_SHA" "SukiSU source: $SUKI_SHA" "SUSFS source: $SUSFS_SHA" "AnyKernel3 source: $AK3_SHA" 'Device: RMX5010 GT7 Pro' 'System: RMX5010_16.0.10.500(CN01)' 'Static build checks passed; no physical-device boot test performed.' > verification/build-info.txt
+          zip -qr9 deliverables/verification.zip verification
+          (cd deliverables && sha256sum *.zip *.img > SHA256SUMS.txt)
+          cat deliverables/SHA256SUMS.txt
+      - name: Upload verified deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: GT7Pro-current-verified-deliverables
+          path: deliverables/*
+          if-no-files-found: error
+      - name: Publish downloadable result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="GT7Pro-16.0.10.500-SukiSU-SUSFS-${GITHUB_RUN_ID}"
+          gh release create "$TAG" deliverables/* --title 'GT7 Pro 16.0.10.500 SukiSU Ultra + SUSFS 6.6.118' --notes 'Built from pinned sources with stock 4K configuration. All 3199 required kernel symbol CRCs checked against the current firmware. Contains an AnyKernel3 ZIP and a repacked boot image. Static build and image checks only; no physical-device boot test. Only for RMX5010_16.0.10.500(CN01).'
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GT7Pro-current-build-diagnostics
+          path: |
+            build.log
+            common/out/.config
+            common/out/Module.symvers
+            common/out/compatibility-report.json
+          if-no-files-found: ignore
