@@ -1,5 +1,5 @@
-name: GT7 Pro current 6.6.118 SukiSU SUSFS verified build
-run-name: GT7 Pro RMX5010 16.0.10.500 SukiSU Ultra + SUSFS
+name: GT7 Pro 6.6.118 SukiSU 40900 UAPI2 paired rebuild
+run-name: GT7 Pro 16.0.10.500 SukiSU 40900 UAPI2 + SUSFS rebuild
 
 on:
   workflow_dispatch:
@@ -19,7 +19,9 @@ jobs:
       SUKI_SHA: b20dee702035af09cb2ecb5f35443bbc1747f3e6
       SUSFS_SHA: 0730de4f5d46ee2997f953101b0f608c0b400b38
       AK3_SHA: 020dfeccf9d7e962a48400fc94d3e451df92eead
-      PACKAGE_NAME: GT7Pro_RMX5010_16.0.10.500_SukiSU_Ultra_SUSFS_6.6.118
+      KSU_VERSION: '40900'
+      MANAGER_SHA: 85eb4a95b8a61d756ecf53b9c5785e48e1b15039
+      PACKAGE_NAME: GT7Pro_RMX5010_16.0.10.500_SukiSU_40900_UAPI2_SUSFS_6.6.118
     steps:
       - uses: actions/checkout@v4
       - name: Prepare verified inputs
@@ -49,6 +51,39 @@ jobs:
           test -x clang18/bin/clang
           echo "$GITHUB_WORKSPACE/clang18/bin" >> "$GITHUB_PATH"
           clang18/bin/clang --version
+      - name: Validate pinned manager and builtin API pairing
+        run: |
+          set -euo pipefail
+          mkdir manager-reference
+          curl -fL --retry 3 "https://github.com/SukiSU-Ultra/SukiSU-Ultra/archive/$MANAGER_SHA.tar.gz" | tar -xz --strip-components=1 -C manager-reference
+          curl -fL --retry 3 https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases/download/v4.2.0/SukiSU_v4.2.0_40900-release.apk -o SukiSU-40900.apk
+          echo '4ca9810e6355fbff0bbe4bf5ce159808e64a40d85987a11894030cd990a6bdf3  SukiSU-40900.apk' | sha256sum -c -
+          python3 - <<'PY'
+          import pathlib,re,json,os
+          kernel=pathlib.Path('KernelSU/kernel/include/uapi/supercall.h').read_text()
+          manager=pathlib.Path('manager-reference/uapi/supercall.h').read_text()
+          assert re.search(r'KERNEL_SU_UAPI_VERSION,\s*2\)',kernel)
+          assert re.search(r'KERNEL_SU_UAPI_VERSION\s*=\s*2;',manager)
+          assert os.environ['KSU_VERSION']=='40900'
+          def constants(s):
+              r=dict(re.findall(r'static const __u(?:8|32)\s+(\w+)\s*=\s*([^;]+);',s))
+              r.update(re.findall(r'DECLARE\(__u(?:8|32),\s*(\w+),\s*([^;]+)\);',s))
+              return {k:re.sub(r'\s+','',v) for k,v in r.items()}
+          kc,mc=constants(kernel),constants(manager)
+          assert all(mc.get(k)==v for k,v in kc.items()),'Builtin and manager command numbers differ'
+          def structs(s):
+              s=re.sub(r'/\*.*?\*/|//[^\n]*','',s,flags=re.S)
+              return {k:re.sub(r'\s+','',v) for k,v in re.findall(r'struct\s+(\w+)\s*\{([^}]+)\};',s)}
+          ks,ms=structs(kernel),structs(manager)
+          assert all(ms.get(k)==v for k,v in ks.items()),'Builtin and manager command layouts differ'
+          assert pathlib.Path('KernelSU/kernel/include/uapi/app_profile.h').read_text()==pathlib.Path('manager-reference/uapi/app_profile.h').read_text()
+          optional=sorted(set(mc)-set(kc))
+          assert optional==['KSU_IOCTL_SET_SPOOF_CPU','KSU_IOCTL_SET_SPOOF_VERSION'],optional
+          assert '#define KERNEL_SU_VERSION KSU_VERSION' in pathlib.Path('KernelSU/kernel/include/ksu.h').read_text()
+          report=dict(manager_version=40900,driver_version=40900,manager_uapi=2,driver_uapi=2,common_commands_checked=len(kc),common_structs_checked=len(ks),app_profile_identical=True,optional_manager_commands_not_in_builtin=optional,manager_apk_sha256='4ca9810e6355fbff0bbe4bf5ce159808e64a40d85987a11894030cd990a6bdf3',source_sha=os.environ['SUKI_SHA'],manager_source_sha=os.environ['MANAGER_SHA'],passed=True)
+          pathlib.Path('manager-pairing.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PY
       - name: Apply SukiSU and SUSFS strictly
         run: |
           set -euo pipefail
@@ -117,14 +152,14 @@ jobs:
           openssl x509 -inform DER -in certs/stock-trusted.der -out certs/stock-trusted.pem
           scripts/config --file out/.config -e KSU -e KSU_SUSFS -d KPM -d KSU_DEBUG -d LOCALVERSION_AUTO --set-str LOCALVERSION '-android15-8-SukiSU-SUSFS-4k'
           scripts/config --file out/.config --set-str SYSTEM_TRUSTED_KEYS 'certs/stock-trusted.pem'
-          make O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 olddefconfig
+          make O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION="$KSU_VERSION" VERSION_TAG=4.2.0 olddefconfig
           grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_ARM64_4K_PAGES|CONFIG_CFI_CLANG|CONFIG_MODVERSIONS|CONFIG_LOCALVERSION)=' out/.config
-          make O=out LLVM=1 ARCH=arm64 LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 kernelrelease
+          make O=out LLVM=1 ARCH=arm64 LOCALVERSION= KSU_VERSION="$KSU_VERSION" VERSION_TAG=4.2.0 kernelrelease
       - name: Compile kernel and modules
         run: |
           set -euo pipefail
           cd common
-          make -j"$(nproc)" O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION=40940 VERSION_TAG=4.2.0 Image modules 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          make -j"$(nproc)" O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= KSU_VERSION="$KSU_VERSION" VERSION_TAG=4.2.0 Image modules 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
       - name: Validate the actual image and all required kernel interfaces
         run: |
           set -euo pipefail
@@ -146,6 +181,27 @@ jobs:
           llvm-nm common/out/vmlinux > kernel-symbols.txt
           grep -E ' susfs_init$' kernel-symbols.txt
           grep -E ' kernelsu_init$' kernel-symbols.txt
+      - name: Audit actual compiler version define and stock configuration differences
+        run: |
+          set -euo pipefail
+          grep -F -- '-DKSU_VERSION=40900' common/out/drivers/kernelsu/.ksu.o.cmd >/dev/null
+          llvm-objdump -d --disassemble-symbols=do_get_info common/out/vmlinux > driver-get-info-disassembly.txt
+          python3 - <<'PY'
+          import pathlib,re,json
+          def config(p):return dict(re.findall(r'^(CONFIG_\w+)=(.*)$',pathlib.Path(p).read_text(),re.M))
+          stock=config('gt7pro-inputs/stock.config');new=config('common/out/.config')
+          changes={n:dict(stock=v,new=new.get(n,'n')) for n,v in stock.items() if v!=new.get(n,'n')}
+          allowed={'CONFIG_LOCALVERSION','CONFIG_LOCALVERSION_AUTO','CONFIG_SYSTEM_TRUSTED_KEYS','CONFIG_HMBIRD_SCHED','CONFIG_MODULE_SCMVERSION'}
+          assert not set(changes)-allowed,changes
+          r=json.loads(pathlib.Path('common/out/compatibility-report.json').read_text())
+          r['manager_pairing']=json.loads(pathlib.Path('manager-pairing.json').read_text())
+          r['actual_compiler_driver_version']=40900
+          r['stock_configuration_differences']=changes
+          r['known_source_limitations']=['Source lacks stock HMBIRD_SCHED and MODULE_SCMVERSION; same source baseline as prior image that booted on this phone.','Builtin driver does not offer optional native CPU/version spoof ioctls; SUSFS uname functionality is separate.']
+          r['new_image_physical_device_test']=False
+          pathlib.Path('common/out/compatibility-report.json').write_text(json.dumps(r,indent=2))
+          print('Actual compiler define: 40900; paired manager API: 2; original critical configuration differences audited')
+          PY
       - name: Repack current-version boot offline
         run: |
           set -euo pipefail
@@ -193,13 +249,20 @@ jobs:
           cp common/out/.config verification/kernel.config
           cp common/out/Module.symvers verification/Module.symvers
           cp common/out/compatibility-report.json verification/
+          cp manager-pairing.json driver-get-info-disassembly.txt verification/
+          cp SukiSU-40900.apk deliverables/SukiSU-official-40900.apk
           cp gt7pro-inputs/anykernel.sh verification/
           printf '%s\n' "Kernel source: $KERNEL_SHA" "SukiSU source: $SUKI_SHA" "SUSFS source: $SUSFS_SHA" "AnyKernel3 source: $AK3_SHA" 'Device: RMX5010 GT7 Pro' 'System: RMX5010_16.0.10.500(CN01)' 'Static build checks passed; no physical-device boot test performed.' > verification/build-info.txt
           zip -qr9 deliverables/verification.zip verification
           cp common/COPYING deliverables/kernel-LICENSE.txt
           cat > deliverables/READ-ME.txt <<'TXT'
           适用：真我 GT7 Pro RMX5010，RMX5010_16.0.10.500(CN01)，Android 16。
-          内核：6.6.118，4K，内置 SukiSU Ultra + SUSFS 2.3.0。
+          内核：6.6.118，4K，内置 SukiSU Ultra 40900 / UAPI 2 + SUSFS 2.3.0。
+          配套：官方 v4.2.0 管理器 40900 / UAPI 2，与用户现有管理器一致。
+          不要用接口 4 的 40940 开发版管理器。
+          此次重新编译修正驱动编号，并对照官方管理器源码检查共同命令与数据结构。
+          已保留可启动基线；公开源码仍缺少原厂 HMBIRD_SCHED 和 MODULE_SCMVERSION。
+          内置驱动没有管理器可选的原生 CPU/版本伪装接口；SUSFS 的 uname 功能另有接口。
           AnyKernel3.zip 是内核安装包；boot.img 是使用当前版本原厂 boot 生成的完整镜像。
           两种文件用于同一次内核更换，只需选择一种方式。boot.img 对应 boot 分区。
           不要把 boot.img 写入 init_boot、vendor_boot 或其他分区。
@@ -209,12 +272,12 @@ jobs:
           verification.zip 包含构建配置、接口表和检查报告；SHA256SUMS.txt 用于核对下载文件。
           源码和补丁：本仓库 Build_gt7pro_current.yml 与 gt7pro-current-inputs.tar.gz。
           TXT
-          (cd deliverables && sha256sum *.zip *.img > SHA256SUMS.txt)
+          (cd deliverables && sha256sum *.zip *.img *.apk > SHA256SUMS.txt)
           cat deliverables/SHA256SUMS.txt
       - name: Upload verified deliverables
         uses: actions/upload-artifact@v4
         with:
-          name: GT7Pro-current-verified-deliverables
+          name: GT7Pro-paired-40900-deliverables
           path: deliverables/*
           if-no-files-found: error
       - name: Publish downloadable result
@@ -222,8 +285,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="GT7Pro-16.0.10.500-SukiSU-SUSFS-${GITHUB_RUN_ID}"
-          gh release create "$TAG" deliverables/* --title 'GT7 Pro 16.0.10.500 SukiSU Ultra + SUSFS 6.6.118' --notes 'Built from pinned sources with stock 4K configuration and original module trust certificate. All 3831 required vmlinux symbol CRCs checked against current vendor_boot, vendor_dlkm and system_dlkm modules. Original modules also provide the remaining imported symbols. Contains an AnyKernel3 ZIP and a repacked boot image. Static build and image checks only; no physical-device boot test. Only for RMX5010_16.0.10.500(CN01).'
+          TAG="GT7Pro-16.0.10.500-SukiSU40900-UAPI2-${GITHUB_RUN_ID}"
+          gh release create "$TAG" deliverables/* --title 'GT7 Pro 16.0.10.500 SukiSU 40900 UAPI2 + SUSFS 6.6.118' --notes 'Freshly rebuilt for official SukiSU v4.2.0 manager 40900/UAPI2. Compiler define and common manager/driver commands and structures checked. Known source limitations (stock HMBIRD scheduler metadata and optional native spoof interfaces) are listed in verification report. Built from pinned sources with stock 4K configuration and original module trust certificate. All 3831 required vmlinux symbol CRCs checked against current vendor_boot, vendor_dlkm and system_dlkm modules. Original modules also provide the remaining imported symbols. Contains an AnyKernel3 ZIP and a repacked boot image. Static build and image checks only; no physical-device boot test. Only for RMX5010_16.0.10.500(CN01).'
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -235,5 +298,7 @@ jobs:
             common/out/Module.symvers
             common/out/compatibility-report.json
             common/out/arch/arm64/boot/Image
+            manager-pairing.json
+            driver-get-info-disassembly.txt
           if-no-files-found: ignore
           include-hidden-files: true
